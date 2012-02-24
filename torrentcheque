@@ -1,0 +1,260 @@
+#!/usr/bin/perl
+# - Based on vesion 0.1.0.3-BETA of TorrentSpy from http://torrentspy.sf.net/
+#   Copyright 2003 "knowbuddy" who is at users.sourceforge.net
+#   SourceForge indicates "MIT License"
+#
+#   The MIT License:
+#
+#       Permission is hereby granted, free of charge, to any person obtaining a
+#       copy of this software and associated documentation files (the "Software"),
+#       to deal in the Software without restriction, including without limitation
+#       the rights to use, copy, modify, merge, publish, distribute, sublicense,
+#       and/or sell copies of the Software, and to permit persons to whom the
+#       Software is furnished to do so, subject to the following conditions:
+#
+#       The above copyright notice and this permission notice shall be included in
+#       all copies or substantial portions of the Software.
+#
+#       THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+#       IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#       FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+#       AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#       LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+#       FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+#       DEALINGS IN THE SOFTWARE.
+#
+# Purpose :
+#
+# 1. Identify .torrent hash, lookup hash against fenopy.eu's api
+# 2. Remove fake torrents
+# 3. rsync fake torrents db with kickass torrents
+# 4. Compare .torrent against fake torrent db
+# 5. Remove fake torrents
+# 6. Check .tracker
+#
+# Requirements
+#
+# Google Search
+#	sudo perl -MCPAN -e shell
+#		- type your password, and when you see cpan[1]> type the following (afterwards type exit) **
+#
+#	install Google::Search
+use strict;
+
+# This is part of modern Perl distributions.
+use FindBin;
+use lib "$FindBin::Bin";
+use File::Copy;
+use File::Basename;
+
+#See requirements above to install google search
+use Google::Search;
+
+# These are part of modern Perl distributions.
+use Getopt::Long;
+
+# These modules aren't necessarily "standard" with Perl.  You might need to
+# install them seperately.
+use Digest::SHA1 qw(sha1);
+use LWP::UserAgent;
+
+# This is part of TorrentSniff, and should have been distributed with it.
+use BitTorrent::BDecode;
+
+my $VERSION = '0.1';
+my $PROGRAM_NAME = 'TorrentCheque';
+my $TORRENT_HASH;
+
+main();
+exit 0;
+
+sub main {
+ 	# Autoflush stdout so messages to stderr will stick with the associated
+        # stdout messages.
+        local $| = 1;
+
+	my $opt_torrent_directory;
+	my $opt_help = 0;
+	my $opt_search;
+
+	 GetOptions (
+                'd|torrent-directory!' => \$opt_torrent_directory,
+                'h|?|help' => \$opt_help,
+		'g|search!' => \$opt_search,
+                ) or usage_exit();
+
+	if($opt_help) {
+        	usage_exit();
+        }
+
+	my ($directory) = (1) ;
+	if($opt_torrent_directory) {
+		$directory || 0;
+	}
+
+	if($directory == 0) {
+                print STDERR "No torrent directory requested.\n";
+                usage_exit();
+        }
+
+	if($opt_search) {
+		my $word;
+		$word = $ARGV[0];
+                google_search($word);
+                exit 0;
+	}
+
+	if(not @ARGV) {
+                usage_exit();
+        }
+	
+	foreach my $arg (@ARGV) {
+                if($arg =~ m|://|) {
+			#http url torrent processing
+		} else {
+			process_dir($arg, $directory);
+		}
+	}
+}
+
+sub process_dir {
+	my $ua = LWP::UserAgent->new;
+	$ua->agent($PROGRAM_NAME . "/" . $VERSION);
+
+	my($file, $directory) = @_;	
+	local *TOR;
+	if( not open(TOR, "<", $file) ) {
+                print STDERR "Unable to read $file because of $!\n";
+                return 0;
+        }
+	binmode(TOR);
+	my $body;
+	read(TOR, $body, (-s $file));
+        close(TOR);
+        output_torrent_data($body, $directory, $file);
+}
+
+sub output_torrent_data {
+        my($body, $directory, $file) = @_;
+        my $result = process_torrent_data($body);
+        if(not defined $result) {
+                print STDERR "Problem reading torrent file\n";
+        }
+
+        if($directory) {
+                #print  "$result->{'hash'}\n";
+		# 1. Identify .torrent hash, lookup hash against fenopy.eu's api
+		fenopy_api("$result->{'hash'}",$file);
+        }
+}
+
+sub process_torrent_data {
+        my($body) = @_;
+        my %result;
+        my $t = BitTorrent::BDecode::bdecode(\$body);
+        my $info = $t->{'info'};
+        my $s = substr($body, $t->{'_info_start'}, $t->{'_info_length'});
+        my $hash = bin2hex(sha1($s));
+        my $announce = $t->{'announce'};
+
+        $result{'hash'} = $hash;
+        $result{'announce'} = $announce;
+        $result{'files'} = [];
+        my $tsize = 0;
+        if(defined($info->{'files'})) {
+                foreach my $f (@{$info->{'files'}}) {
+                        my %file_record = ( 'size' => $f->{'length'});
+
+                        $tsize += $f->{'length'};
+                        my $path = $f->{'path'};
+
+                        if(ref($path) eq 'ARRAY') {
+                                $file_record{'name'} = $info->{'name'}.'/'.$path->[0];
+                        } else {
+                                $file_record{'name'} = $info->{'name'}.'/'.$path;
+                        }
+                        push @{$result{'files'}}, \%file_record;
+
+                }
+        } else {
+                $tsize += $info->{'length'},
+
+		push @{$result{'files'}},
+                        {
+                                'size' => $info->{'length'},
+                                'name' => $info->{'name'},
+                        };
+        }
+        $result{'total_size'} = $tsize;
+
+        return \%result;
+}
+
+# Add commas to number
+sub commify {
+	local $_ = shift;
+	1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
+	return $_;
+}
+
+# Encode binary as hex characters
+sub bin2hex {
+	my ($d) = @_;
+	$d =~ s/(.)/sprintf("%02x",ord($1))/egs;
+	$d = lc($d);
+	return $d;
+}
+
+#query fenopy using the torrents hash and remove the file from the torrent directory if not verified
+sub fenopy_api {
+	my ($hash, $file) = @_;
+        my $req = HTTP::Request->new(POST => "http://fenopy.eu/fakefinder/api.php?hash=$hash");
+        $req->content_type('application/x-www-form-urlencoded');
+        $req->content('query=libwww-perl&mode=dist');
+        #Pass request to the user agent and get a response back
+	my $ua;
+	if(not defined $ua) {
+                $ua = LWP::UserAgent->new(
+                        'env_proxy' => 1,
+                        'agent'          => "$PROGRAM_NAME/$VERSION ",
+                        'timeout'        => 15,
+                );
+	}
+        my $res = $ua->request($req);
+        # Check the outcome of the response
+        if ($res->is_success)
+        {
+		if ($res->content eq "verified")
+                {
+                	#do something with verified files
+			#print "$file\n";
+			#copy($oldfile, $newfile) or die $!;		
+			#my $newdir = strip_dir($file);
+			#my @result = split(//\|\\, $newdir);
+			print $res->content, " : $hash\n" ;
+			google_search($hash);
+                } else {
+                        #remove file
+			unlink ($file) or die $!;
+			print $res->content, " : $hash DELETED!\n" ;
+                }
+        }  else {
+		print "Status: Failed to resolve using fenopy.eu's api!\n";
+        }
+}
+
+sub google_search {
+	# initiate google search and input our give variable keyword which is $word
+	my ($word) = @_;
+	
+	#REMOVE IF TESTING WITH -g SWITCH!
+	#
+	$word = $word . " +filetype:torrent";
+	#
+	#
+	my $search = Google::Search->Web( query => $word );
+	while ( my $result = $search->next ) { # this will search first 50 results
+		# this will output our google search results back to console.
+		print $result->rank, " - ", $result->uri, "\n";
+	} #while
+} #search
